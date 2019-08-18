@@ -1,0 +1,725 @@
+---
+title: "Logistics Project"
+author: "Aziz Benmosbah"
+date: "29/01/2019"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+###Loading and preparing the Data 
+
+```{r}
+library(sqldf)
+library(readr)
+library(readxl)
+
+ 
+
+pos_ordersale <- read_csv("Data/pos_ordersale.csv")
+menuitem <- read_csv("Data/menuitem.csv")
+store_restaurant <- read_excel("Data/store_restaurant.xlsx")
+menu_items<- read_csv("Data/menu_items.csv")
+recipes<- read_csv("Data/recipes.csv")
+recipe_ingredient_assignments<- read_csv("Data/recipe_ingredient_assignments.csv")
+recipe_sub_recipe_assignments<- read_csv("Data/recipe_sub_recipe_assignments.csv")
+sub_recipes<- read_csv("Data/sub_recipes.csv")
+sub_recipe_ingr_assignments<- read_csv("Data/sub_recipe_ingr_assignments.csv")
+ingredients <- read_csv("Data/ingredients.csv")
+portion_uom_types<- read_csv("Data/portion_uom_types.csv")
+
+```
+
+```{r}
+library(ggplot2)
+library(forecast)
+library(tseries)
+```
+
+We rename the primary keys in 'menu_items' and 'menuitem' so we can join the tables in an inner join using SQL.
+
+```{r}
+names(menuitem)[14]<-paste("MenuItemId")
+```
+
+
+We create tables that have three columns, date, store number, and quantity of lettuce consumed for sub_recipes and recipes
+```{r}
+Lettuce_recipes <- sqldf("
+      SELECT pos_ordersale.date, pos_ordersale.StoreNumber, recipe_ingredient_assignments.quantity*menuitem.Quantity as Quantity
+      FROM pos_ordersale
+      INNER JOIN menuitem
+      using(MD5KEY_ORDERSALE)
+      INNER JOIN menu_items
+      using(MenuItemId)
+      INNER JOIN recipes
+      using(RecipeId)
+      INNER JOIN recipe_ingredient_assignments
+      using(RecipeId)
+      INNER JOIN ingredients
+      using(IngredientId)
+      INNER JOIN portion_uom_types
+      using(PortionUOMTypeId)
+      WHERE IngredientID = 27
+      ORDER BY pos_ordersale.date
+      ")
+
+Lettuce_sub_recipes <- sqldf("
+      SELECT pos_ordersale.date, pos_ordersale.StoreNumber, sub_recipe_ingr_assignments.quantity*recipe_sub_recipe_assignments.Factor*menuitem.Quantity AS Quantity
+      FROM pos_ordersale
+      INNER JOIN menuitem
+      using(MD5KEY_ORDERSALE)
+      INNER JOIN menu_items
+      using(MenuItemId)
+      INNER JOIN recipes
+      using(RecipeId)
+      INNER JOIN recipe_sub_recipe_assignments
+      using(RecipeId)
+      INNER JOIN sub_recipe_ingr_assignments
+      using(SubRecipeId)
+      INNER JOIN ingredients
+      using(IngredientId)
+      INNER JOIN portion_uom_types
+      using(PortionUOMTypeId)
+      WHERE IngredientID = 27
+      ORDER BY pos_ordersale.date
+      ")
+```
+
+
+We then join the recipes and sub_recipes table for for each restaurant.
+
+We obtain a dataset that describes the daily lettuce consumption of the Ninth Street restaurant from the 5th of March 2015 to the 15th of June 2015. Each observation includes two values, the day and the quantity of lettuce consumed. We turn this data set to a time series with frequency 7 as we want to forecast the daily consumption of lettuce and we have daily observation of the past. Intuition tells us that the forecast for lettuce consumption in restaurants should be done weekly as Mondays should not be used to forecast lettuce consumption on Saturdays.
+
+
+##Ninth Street
+
+```{r}
+NinthSt1 <- sqldf('SELECT * FROM Lettuce_recipes WHERE StoreNumber = 46673')
+NinthSt2 <- sqldf('SELECT * FROM Lettuce_sub_recipes WHERE StoreNumber = 46673')
+
+NinthSt1 <- sqldf('SELECT date, SUM(Quantity) as Quantity FROM NinthSt1 GROUP BY date')
+NinthSt2 <- sqldf('SELECT date, SUM(Quantity) as Quantity FROM NinthSt2 GROUP BY date')
+
+j <- 0
+i <- 0
+
+for (elem in NinthSt2$date){
+  j <- j+1
+  if (elem %in% NinthSt1$date) {
+     i <- i+1
+    
+     NinthSt2[j,'Quantity'] <- NinthSt2[j,'Quantity'] + NinthSt1[i,'Quantity']
+    
+  }
+}
+
+NinthSt <- NinthSt2
+```
+
+###Creating the time series 
+
+```{r}
+NinthStreet <- ts(NinthSt[, 2], frequency = 7, start = c(11,5))
+```
+
+```{r}
+NinthStreet
+```
+
+
+First, let us visualize the resulting time series
+```{r}
+autoplot(NinthStreet)
+ggtsdisplay(NinthStreet)
+```
+Judging from the plots this time series observes no trend and is indeed stationary. However, in the ACF we have a significant lag every 7 lags which can indicate stationary seasonality and eventually $P>=1$. The PACF plot does not seem to produce any useful insight.
+
+
+###Testing for stationarity
+```{r}
+adf.test(NinthStreet)
+pp.test(NinthStreet)
+kpss.test(NinthStreet)
+```
+All three tests suggest that the time series is stationary. 
+
+
+Furthermore we can use the following functions to double check if there is a need for differenciation. Indeed, the tests cannot be completely trusted with regard to seasonal stationarity.
+```{r}
+#stationarity 
+ndiffs(NinthStreet)
+# seasonal stationarity
+nsdiffs(NinthStreet)
+```
+As we can see, this data is stationary point by point however it has seasonal stationarity. Thus, it needs a one-time seasonal differenciation.
+
+###Differenciating the time series
+
+As it is seasonaly stationary, this time series needs a lag 7 differenciation which is also the frequency of the time series.
+```{r}
+NinthStreet.diff <-  diff(NinthStreet, differences = 1, lag = 7)
+autoplot(NinthStreet.diff)
+ggtsdisplay(NinthStreet.diff)
+```
+As we can see now a part from the seventh lag in the PACF and the ACF, all lags are not significant which may mean means that $P, Q <= 1$ and $D = 1$ because of the seasonal differenciation needed to make the data seasonal.
+
+###Auto Arima
+
+Next we use $auto.arima()$ to evaluate the quality of various ARIMA models. Potentially, we can use our earlier analysis as input to refine the models that will be evaluated by $auto.arima()$, and run a stepwise search. We run $auto.arima()$ on the whole data but the last two weeks which we leave as test-set. Since we want to forecast lettuce consumption over two weeks after the data it makes sense that we test our models' accuracies on the last two weeks of available data.
+```{r}
+# choose optimal p and q based on information criteria
+auto.arima(window(NinthStreet, end = c(23,1)), max.P = 1, D = 1, max.Q = 1, trace = TRUE, ic = 'bic')
+
+```
+Hence the best possible ARIMA model with regard to BIC for the forecast of this particular time series is ARIMA(0,0,0)(0,1,1). For accuracy's sake we take the best two models and compare their respective performances on the test set before taking any final decision.
+
+We finally run the model 
+```{r}
+#Fitting the model 
+
+NinthSt.m1 <- Arima(window(NinthStreet, end = c(23,1)), order = c(0, 0, 0), seasonal = list(order = c(0, 1, 1), period = 7), include.drift = FALSE)
+NinthSt.m2 <- Arima(window(NinthStreet, end = c(23,1)), order = c(1, 0, 0), seasonal = list(order = c(0, 1, 1), period = 7), include.drift = FALSE)
+#out of sample one step ahead forecast
+
+NinthSt.f1 <- Arima(window(NinthStreet, start = c(23,1)), model = NinthSt.m1)
+
+NinthSt.f2 <- Arima(window(NinthStreet, start = c(23,1)), model = NinthSt.m2)
+```
+
+
+###Testing Accuracy
+
+A couple of functions are proved to be useful for us to evaluate the in-sample performance/fit of the model. One is $accuracy()$ function, which summarizes various measures of fitting errors. 
+```{r}
+# in-sample one-step forecasts
+accuracy(NinthSt.f1)
+accuracy(NinthSt.f2)
+```
+```{r}
+# out-of-sample multi-step ahead forecasts
+accuracy(forecast(NinthSt.m1, h = 14), window(NinthStreet, start = c(23, 1)))
+accuracy(forecast(NinthSt.m2, h = 14), window(NinthStreet, start = c(23, 1)))
+```
+We can see that the second model is slightly better than the first one in one-step forecasts. As the primary goal of the company is to forecast the DAILY lettuce consumption we decide to retain the second model rather than the first.
+
+
+In the post-estimation analysis, we would also like to check out the residual plots, including time series, ACFs and etc, to make sure that there is no warning message. In particular, residuals shall have a zero mean, constant variance, and distributed symmetrically around mean zero. ACF of any lag greater 0 shall be statistically insignificant. 
+```{r}
+# residual analysis
+autoplot(NinthSt.f2$residuals)
+ggAcf(NinthSt.f2$residuals)
+checkresiduals(NinthSt.f2)
+```
+As we can see this model has the requirements needed to be retained according to the residuals plot and the ACF.
+
+
+### Forecast: ARIMA
+
+Finally we fit the model with all our data  and we run a forecast and the 14 days (2 weeks) after data stops
+```{r}
+# forecast
+NinthSt.mf <- Arima(NinthStreet, order = c(1, 0, 0), seasonal = list(order = c(0, 1, 1), period = 7), include.drift = FALSE)
+NinthSt.final <- forecast(NinthSt.mf, h = 14)
+autoplot(NinthSt.final)
+
+```
+
+
+### Holt-Winters
+
+```{r}
+decompose1 <- stl(NinthStreet, s.window = 7)
+plot(decompose1)
+```
+
+From the allure of the time series different component one can suppose that the seasonal component is nor multiplicative or additive as it observes no trend. The trend component however is clearly additive.
+
+```{r}
+NinthStreet.ets <- ets(NinthStreet, model = 'ZZZ')
+
+accuracy(NinthStreet.ets)
+```
+The Holt-Winters is more performant as it has an RMSE of 25.47736 compared to 35.78 for our ARIMA model
+
+
+### Forecast: Holt-Winters
+
+```{r}
+NinthStreet.ets.f <- forecast(NinthStreet.ets, h = 14)
+
+plot(NinthStreet.ets.f)
+lines(fitted(NinthStreet.ets.f), col = "blue")
+
+```
+The parameters of the ETS coincide with our observations of the components.
+
+
+Our final model for this restaurant will be ETS(M,N,A)
+```{r}
+forecast_46673 <- tail(NinthStreet.ets.f$fitted, 14)
+```
+
+
+Shattuck Sq:
+
+```{r}
+Shattuck1 <- sqldf('SELECT * FROM Lettuce_recipes WHERE StoreNumber = 4904')
+Shattuck2 <- sqldf('SELECT * FROM Lettuce_sub_recipes WHERE StoreNumber = 4904')
+
+Shattuck1 <- sqldf('SELECT date, SUM(Quantity) as Quantity FROM Shattuck1 GROUP BY date')
+Shattuck2 <- sqldf('SELECT date, SUM(Quantity) as Quantity FROM Shattuck2 GROUP BY date')
+
+j <- 0
+i <- 0
+
+
+for (elem in Shattuck2$date){
+  j <- j+1
+  if (elem %in% Shattuck1$date) {
+     i <- i+1
+    
+     Shattuck2[j,'Quantity'] <- Shattuck2[j,'Quantity'] + Shattuck1[i,'Quantity']
+    
+  }
+}
+
+
+Shattuck <- Shattuck2
+```
+
+###Creating the time series 
+
+```{r}
+ShattuckSq <- ts(Shattuck[, 2], frequency = 7, start = c(11,5))
+```
+
+
+First, let us visualize the resulting time series
+```{r}
+autoplot(ShattuckSq)
+ggtsdisplay(ShattuckSq)
+```
+
+We see what seems to be a seasonal significance in the seventh lags in both ACF and PACF plots. The last significant lag of the PACF is the seventh. This may imply that $max.Q = 1$. Furthermore we do not see any trend or seasonality in the time series graph. 
+
+###Testing for stationarity
+
+```{r}
+adf.test(ShattuckSq)
+pp.test(ShattuckSq)
+kpss.test(ShattuckSq)
+```
+ADF and PPUR test reject the null hypothesis, thus rejecting the hypothesis of non stationarity. However the third test states that $H_0 := Trend Stationarity$ can be rejected at 10% significance
+
+
+
+###Differenciating the time series
+```{r}
+#stationarity 
+ndiffs(ShattuckSq)
+# seasonal stationarity
+nsdiffs(ShattuckSq)
+```
+This time series needs a one degree seasonal differenciation in order to be stationary
+
+```{r}
+ShattuckSq.diff <-  diff(ShattuckSq, differences = 1, lag = 7)
+autoplot(ShattuckSq.diff)
+ggtsdisplay(ShattuckSq.diff)
+```
+ACF: Only the seventh lag is significant 
+PACF: The seventh and the eighth lag are significant
+
+This being said, the significant lags are not a lot more significant than the other ones simply because they are slightly above the blue threshold. Thus, even if these plots might indicate the values of $P$ and $Q$ we are not going to restrict the auto.arima function to generate the best possible model. Only the differenciation is taken into account with $D = 1$
+
+
+###Auto Arima
+```{r}
+# choose optimal p and q based on information criteria
+auto.arima(window(ShattuckSq, end = c(23,1)), D = 1, trace = TRUE, ic = 'bic')
+
+```
+
+
+As done before we run the best two models with regard to BIC. We fit them on all the data but the last two weeks and we test their accuracy on the last two weeks.
+```{r}
+#Fitting the model 
+
+ShattuckSq.m1 <- Arima(window(ShattuckSq, end = c(23,1)), order = c(0, 0, 0), seasonal = list(order = c(2, 1, 0), period = 7), include.drift = FALSE)
+ShattuckSq.m2 <- Arima(window(ShattuckSq, end = c(23,1)), order = c(1, 0, 1), seasonal = list(order = c(2, 1, 0), period = 7), include.drift = FALSE)
+#out of sample one step ahead forecast
+
+ShattuckSq.f1 <- Arima(window(ShattuckSq, start = c(23,1)), model = ShattuckSq.m1)
+
+ShattuckSq.f2 <- Arima(window(ShattuckSq, start = c(23,1)), model = ShattuckSq.m2)
+```
+
+###Testing Accuracy
+
+```{r}
+# in-sample one-step forecasts
+accuracy(ShattuckSq.f1)
+accuracy(ShattuckSq.f2)
+```
+
+```{r}
+# out-of-sample multi-step ahead forecasts
+accuracy(forecast(ShattuckSq.m1, h = 14), window(ShattuckSq, start = c(23, 1)))
+accuracy(forecast(ShattuckSq.m2, h = 14), window(ShattuckSq, start = c(23, 1)))
+```
+The second model seems more performant than the first one both in out-of-sample multi-step ahead forecasting and the more important in sample one-step forecasts. 
+
+Thus we retain it as our final model for this restaurant after running a residual analysis to check the ACF plot and the distribution of the residuals.
+
+```{r}
+# residual analysis
+autoplot(ShattuckSq.f2$residuals)
+ggAcf(ShattuckSq.f2$residuals)
+checkresiduals(ShattuckSq.f2)
+```
+
+### Forecast: ARIMA
+
+Fitting the model on all the data and forecasting the next two weeks
+```{r}
+# forecast
+ShattuckSq.m2 <- Arima(ShattuckSq, order = c(1, 0, 1), seasonal = list(order = c(2, 1, 0), period = 7), include.drift = FALSE)
+ShattuckSq.final <- forecast(ShattuckSq.m2, h = 14)
+autoplot(ShattuckSq.final)
+ShattuckSq.final
+```
+
+
+### Holt-Winters
+
+
+```{r}
+decompose2 <- stl(ShattuckSq, s.window = 7)
+plot(decompose2)
+```
+As with the previous restaurant we see that the trend component is additive and that the seasonal component observes no trend.
+
+```{r}
+ShattuckSq.ets <- ets(ShattuckSq, model = 'ZZZ')
+
+accuracy(ShattuckSq.ets)
+```
+Here the Holt-Winters is less performant than the ARIMA model that we selected with an RMSE of 42.19116 compared to 21.83 for ARIMA.
+
+
+### Forecast: Holt-Winters
+
+```{r}
+ShattuckSq.ets.f <- forecast(ShattuckSq.ets, h = 14)
+
+plot(ShattuckSq.ets.f)
+lines(fitted(ShattuckSq.ets.f), col = "blue")
+
+```
+
+Our final model for this restaurant will be ARIMA(1,0,1)(2,1,0)
+
+```{r}
+forecast_4904 <- tail(ShattuckSq.final$fitted, 14)
+```
+
+Myrtle Avenue:
+
+```{r}
+MyrtleAv1 <- sqldf('SELECT * FROM Lettuce_recipes WHERE StoreNumber = 12631')
+MyrtleAv2 <- sqldf('SELECT * FROM Lettuce_sub_recipes WHERE StoreNumber = 12631')
+
+MyrtleAv1 <- sqldf('SELECT date, SUM(Quantity) as Quantity FROM MyrtleAv1 GROUP BY date')
+MyrtleAv2 <- sqldf('SELECT date, SUM(Quantity) as Quantity FROM MyrtleAv2 GROUP BY date')
+
+j <- 0
+i <- 0
+
+for (elem in MyrtleAv2$date){
+  j <- j+1
+  if (elem %in% MyrtleAv1$date) {
+     i <- i+1
+    
+     MyrtleAv2[j,'Quantity'] <- MyrtleAv2[j,'Quantity'] + MyrtleAv1[i,'Quantity']
+    
+  }
+}
+
+MyrtleAv <- MyrtleAv2
+```
+
+### Creating Time Series 
+
+```{r}
+MyrtleAvenue <- ts(MyrtleAv[, 2], frequency = 7, start = c(10,4))
+```
+
+
+First, let us visualize the resulting time series
+```{r}
+autoplot(MyrtleAvenue)
+ggtsdisplay(MyrtleAvenue)
+```
+A slight upward trend in the time series indicates that one-step differenciation might be needed. No seasonality detected by looking at the graph.
+
+###Testing for stationarity 
+
+```{r}
+adf.test(MyrtleAvenue)
+pp.test(MyrtleAvenue)
+kpss.test(MyrtleAvenue)
+```
+ADF and PPUR test reject the null hypothesis at 1% significance, thus rejecting the hypothesis of non stationarity. However the third test states that $H_0 := Trend Stationarity$ can be rejected at 1% significance as well, thus giving us mixed results.
+
+
+###Differenciating the time series
+```{r}
+#stationarity 
+ndiffs(MyrtleAvenue)
+# seasonal stationarity
+nsdiffs(MyrtleAvenue)
+```
+
+One-step differenciation is needed
+```{r}
+MyrtleAvenue.diff <- diff(MyrtleAvenue, differences = 1)
+autoplot(MyrtleAvenue.diff)
+ggtsdisplay(MyrtleAvenue.diff)
+```
+
+The ACF and the PACF plots do not give us a lot of information. There is a seasonal lag every seventh lag on the ACF and only the first lag in the PACF seems to be significant.
+
+
+###Auto Arima
+
+We run $auto.arima$ with $d=1$
+```{r}
+# choose optimal p and q based on information criteria
+auto.arima(window(MyrtleAvenue, end = c(23,1)), d = 1, trace = TRUE, ic = 'bic')
+
+```
+
+
+As done before, we run the best two models
+```{r}
+#Fitting the model 
+
+MyrtleAvenue.m1 <- Arima(window(MyrtleAvenue, end = c(23,1)), order = c(0, 1, 1), seasonal = list(order = c(2, 0, 0), period = 7), include.drift = FALSE)
+MyrtleAvenue.m2 <- Arima(window(MyrtleAvenue, end = c(23,1)), order = c(0, 1, 1), seasonal = list(order = c(1, 0, 0), period = 7), include.drift = FALSE)
+#out of sample one step ahead forecast
+
+MyrtleAvenue.f1 <- Arima(window(MyrtleAvenue, start = c(23,1)), model = MyrtleAvenue.m1)
+
+MyrtleAvenue.f2 <- Arima(window(MyrtleAvenue, start = c(23,1)), model = MyrtleAvenue.m2)
+```
+
+###Testing Accuracy
+
+```{r}
+# in-sample one-step forecasts
+accuracy(MyrtleAvenue.f1)
+accuracy(MyrtleAvenue.f2)
+```
+
+```{r}
+# out-of-sample multi-step ahead forecasts
+accuracy(forecast(MyrtleAvenue.m1, h = 14), window(MyrtleAvenue, start = c(23, 1)))
+accuracy(forecast(MyrtleAvenue.m2, h = 14), window(MyrtleAvenue, start = c(23, 1)))
+```
+The first model is retained as it performs better on all accuracy metrics
+
+
+### Forecast: ARIMA
+
+```{r}
+MyrtleAvenue.mf <- Arima(MyrtleAvenue, order = c(0, 1, 1), seasonal = list(order = c(2, 0, 0), period = 7), include.drift = FALSE)
+MyrtleAvenue.final <- forecast(MyrtleAvenue.mf, h = 14)
+autoplot(MyrtleAvenue.final)
+
+```
+
+### Holt-Winters
+
+```{r}
+decompose2 <- stl(MyrtleAvenue, s.window = 7)
+plot(decompose2)
+```
+
+Small variations in trend in the seasonal component lead us to believe that it is additive. Sharp non-linear increases in the trend indicates that it may be multiplicative.
+
+
+```{r}
+MyrtleAvenue.ets <- ets(MyrtleAvenue, model = 'ZZZ')
+
+accuracy(MyrtleAvenue.ets)
+```
+As we can see here, the Holt-Winters is more accurate than the ARIMA model we have selected on both RMSE and ME metrics.
+
+### Forecast: Holt-Winters
+
+```{r}
+MyrtleAvenue.ets.f <- forecast(MyrtleAvenue.ets, h = 14)
+
+plot(MyrtleAvenue.ets.f)
+lines(fitted(MyrtleAvenue.ets.f), col = "blue")
+
+```
+
+Our model for this restaurant will be ETS(M,A,M)
+```{r}
+forecast_12631 <- tail(MyrtleAvenue.ets.f$fitted,14)
+```
+
+
+##Whitney Avenue
+
+```{r}
+WhitneyAv1 <- sqldf('SELECT * FROM Lettuce_recipes WHERE StoreNumber = 20974')
+WhitneyAv2 <- sqldf('SELECT * FROM Lettuce_sub_recipes WHERE StoreNumber = 20974')
+
+WhitneyAv1 <- sqldf('SELECT date, SUM(Quantity) as Quantity FROM WhitneyAv1 GROUP BY date')
+WhitneyAv2 <- sqldf('SELECT date, SUM(Quantity) as Quantity FROM WhitneyAv2 GROUP BY date')
+
+j <- 0
+i <- 0
+
+for (elem in WhitneyAv2$date){
+  j <- j+1
+  if (elem %in% WhitneyAv1$date) {
+     i <- i+1
+    
+     WhitneyAv2[j,'Quantity'] <- WhitneyAv2[j,'Quantity'] + WhitneyAv1[i,'Quantity']
+    
+  }
+}
+
+#We remove the first six values of this table as they seem inconsistent with the rest of the data
+WhitneyAv <- WhitneyAv2[-c(1:6), ]
+```
+
+
+
+### Creating Time Series 
+
+```{r}
+WhitneyAvenue <- ts(WhitneyAv[, 2], frequency = 7, start = c(13,5))
+```
+
+First, let us visualize the time series
+```{r}
+autoplot(WhitneyAvenue)
+ggtsdisplay(WhitneyAvenue)
+```
+Both in the PACF and in the ACF the seventh lag is seasonaly significant one or two times before becoming insignificant.
+
+Moreoever we see a slight upwards trend in the time series. Thus we can imagine there is both trend and seasonality components which might require 
+do the three test that go for point by point stationarity
+
+###Testing for stationarity 
+
+```{r}
+adf.test(WhitneyAvenue)
+pp.test(WhitneyAvenue)
+kpss.test(WhitneyAvenue)
+```
+
+
+
+###Differenciating the time series
+```{r}
+#stationarity 
+ndiffs(WhitneyAvenue)
+# seasonal stationarity
+nsdiffs(WhitneyAvenue)
+```
+No differenciation needed for this TS
+
+
+###Auto Arima
+```{r}
+# choose optimal p and q based on information criteria
+auto.arima(window(WhitneyAvenue, end = c(23,1)), trace = TRUE, ic = 'bic')
+
+```
+
+
+We take the two models that minimize the BIC as before
+```{r}
+#Fitting the model 
+
+WhitneyAvenue.m1 <- Arima(window(WhitneyAvenue, end = c(23,1)), order = c(0, 0, 0), seasonal = list(order = c(1, 0, 0), period = 7), include.drift = FALSE)
+WhitneyAvenue.m2 <- Arima(window(WhitneyAvenue, end = c(23,1)), order = c(1, 0, 0), seasonal = list(order = c(1, 0, 0), period = 7), include.drift = FALSE)
+#out of sample one step ahead forecast
+
+WhitneyAvenue.f1 <- Arima(window(WhitneyAvenue, start = c(23,1)), model = WhitneyAvenue.m1)
+
+WhitneyAvenue.f2 <- Arima(window(WhitneyAvenue, start = c(23,1)), model = WhitneyAvenue.m2)
+```
+
+
+###Testing Accuracy
+```{r}
+# in-sample one-step forecasts
+accuracy(WhitneyAvenue.f1)
+accuracy(WhitneyAvenue.f2)
+```
+
+```{r}
+# out-of-sample multi-step ahead forecasts
+accuracy(forecast(WhitneyAvenue.m1, h = 14), window(WhitneyAvenue, start = c(23, 1)))
+accuracy(forecast(WhitneyAvenue.m2, h = 14), window(WhitneyAvenue, start = c(23, 1)))
+```
+The first model is slightly better on a one-step forecast but the second model is clearly more performant on multi-step ahead forecast. Thus we keep the second model although we give more importance to the one-step forecast as their performances are largely comparable on the one-step but the second one proved to be more accurate on multi-step ahead forecasts.
+
+### Forecast: ARIMA
+```{r}
+WhitneyAvenue.m1 <- Arima(WhitneyAvenue, order = c(1, 0, 0), seasonal = list(order = c(1, 0, 0), period = 7), include.drift = FALSE)
+WhitneyAvenue.final <- forecast(WhitneyAvenue.m1, h = 14)
+autoplot(WhitneyAvenue.final)
+```
+
+
+### Holt-Winters
+
+```{r}
+decompose3 <- stl(WhitneyAvenue, s.window = 7)
+plot(decompose3)
+```
+
+```{r}
+decompose = decompose(WhitneyAvenue, "additive")
+ 
+plot(as.ts(decompose$seasonal))
+plot(as.ts(decompose$trend))
+plot(as.ts(decompose$random))
+plot(decompose)
+```
+
+No trend in seasonal component. Trend component seems to be additive with an approximately linear decrease on most of the window.
+
+
+
+```{r}
+WhitneyAvenue.ets <- ets(WhitneyAvenue, model = 'ZZZ')
+
+accuracy(WhitneyAvenue.ets)
+```
+As we can see here, the Holt-Winters is more accurate than the ARIMA model we have selected on both RMSE and ME metrics.
+
+
+### Forecast: Holt-Winters
+
+```{r}
+WhitneyAvenue.ets.f <- forecast(WhitneyAvenue.ets, h = 14)
+
+plot(WhitneyAvenue.ets.f)
+lines(fitted(WhitneyAvenue.ets.f), col = "blue")
+
+```
+
+Our model for this restaurant will be ETS(A,N,A)
+```{r}
+forecast_20974 <- tail(WhitneyAvenue.ets.f$fitted,14) 
+```
