@@ -1,4 +1,4 @@
-# Sales Forecasting for a Restaurant chain
+# Sales Forecasting for a Restaurant Chain
 This project is meant to develop time series forecasting models that would help a restaurant chain better manage their stocks. 
 By predicting the rate at which locations consume basic product the company can optimise stockings and minimise food waste.
 
